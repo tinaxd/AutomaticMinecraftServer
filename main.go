@@ -12,7 +12,9 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 )
 
 type EventType int
@@ -20,6 +22,8 @@ type EventType int
 const (
 	EventJoined EventType = iota
 	EventLeft
+	EventSaveQuerySuccess
+	EventSaveQueryData
 )
 
 var (
@@ -29,10 +33,19 @@ var (
 
 type PlayerEvent struct {
 	PlayerID string
+	RawLine  string
 	Event    EventType
 }
 
-func detectEvent(line string) (PlayerEvent, bool) {
+func (d *EventDetector) detectEvent(line string) (PlayerEvent, bool) {
+	if d.nextLineIsSaveQueryData {
+		d.nextLineIsSaveQueryData = false
+		return PlayerEvent{
+			Event:   EventSaveQueryData,
+			RawLine: line,
+		}, true
+	}
+
 	matched := RegexConnected.FindStringSubmatch(line)
 	if matched != nil {
 		return PlayerEvent{
@@ -49,12 +62,26 @@ func detectEvent(line string) (PlayerEvent, bool) {
 		}, true
 	}
 
+	trimed := strings.TrimSpace(line)
+	if trimed == "Data saved. Files are now ready to be copied." {
+		d.nextLineIsSaveQueryData = true
+		return PlayerEvent{
+			Event:   EventSaveQuerySuccess,
+			RawLine: line,
+		}, true
+	}
+
 	return PlayerEvent{}, false
 }
 
 type EventDetector struct {
 	EventChan chan PlayerEvent
 	ForwardTo io.Writer
+
+	EventForwards    []chan PlayerEvent
+	EventForwardLock sync.Mutex
+
+	nextLineIsSaveQueryData bool
 }
 
 func (d *EventDetector) EventProcessingLoop(ctx context.Context) {
@@ -64,6 +91,13 @@ LOOP:
 		select {
 		case event := <-d.EventChan:
 			log.Printf("[Starter] Event: %v", event)
+			func() {
+				d.EventForwardLock.Lock()
+				defer d.EventForwardLock.Unlock()
+				for _, c := range d.EventForwards {
+					c <- event
+				}
+			}()
 		case <-ctx.Done():
 			log.Printf("[Starter] stopping event processing loop")
 			break LOOP
@@ -77,7 +111,7 @@ func (d *EventDetector) Write(p []byte) (int, error) {
 			continue
 		}
 
-		event, ok := detectEvent(line)
+		event, ok := d.detectEvent(line)
 		if !ok {
 			continue
 		}
@@ -86,6 +120,23 @@ func (d *EventDetector) Write(p []byte) (int, error) {
 	}
 
 	return d.ForwardTo.Write(p)
+}
+
+func (d *EventDetector) AddEventListener(ch chan PlayerEvent) {
+	d.EventForwardLock.Lock()
+	defer d.EventForwardLock.Unlock()
+	d.EventForwards = append(d.EventForwards, ch)
+}
+
+func (d *EventDetector) RemoveEventListener(ch chan PlayerEvent) {
+	d.EventForwardLock.Lock()
+	defer d.EventForwardLock.Unlock()
+	for i, c := range d.EventForwards {
+		if c == ch {
+			d.EventForwards = append(d.EventForwards[0:i], d.EventForwards[i+1:]...)
+			break
+		}
+	}
 }
 
 func cmdRunner(cmd *exec.Cmd) <-chan error {
@@ -163,7 +214,89 @@ func main() {
 
 	writeCommand := func(cmd string) error {
 		_, err := fmt.Fprintf(stdin, "%s\n", cmd)
+		log.Printf("wrote command: %v", cmd)
 		return err
+	}
+
+	nowBackuping := false
+	serverStopped := false
+
+	backupSequence := func() error {
+		if serverStopped {
+			log.Printf("unable to backup (server is already stopped)")
+			return nil
+		}
+
+		nowBackuping = true
+		defer func() {
+			nowBackuping = false
+		}()
+
+		// add event listener
+		listener := make(chan PlayerEvent, 10)
+		stdoutDetector.AddEventListener(listener)
+		defer func() {
+			// consume listener
+			for len(listener) > 0 {
+				<-listener
+			}
+			stdoutDetector.RemoveEventListener(listener)
+		}()
+
+		// save hold
+		if err := writeCommand("save hold"); err != nil {
+			return err
+		}
+
+		// wait for save query data in another thread
+		queryLineChan := func() <-chan string {
+			ch := make(chan string, 1)
+			go func() {
+				// wait for save query success
+				for e := range listener {
+					if e.Event == EventSaveQuerySuccess {
+						break
+					}
+				}
+				// wait for save query data
+				line := ""
+				for e := range listener {
+					if e.Event == EventSaveQueryData {
+						line = e.RawLine
+						break
+					}
+				}
+				ch <- line
+			}()
+			return ch
+		}()
+
+		// repeat save query until we get save query result
+		queryLine := ""
+		saveQueryTimer := time.NewTicker(1 * time.Second)
+	LOOP:
+		for {
+			select {
+			case line := <-queryLineChan:
+				queryLine = line
+				saveQueryTimer.Stop()
+				break LOOP
+			case <-saveQueryTimer.C:
+				if err := writeCommand("save query"); err != nil {
+					log.Printf("save query failed")
+				}
+			}
+		}
+
+		// TODO: copy files
+		log.Printf("queryLine: %v", queryLine)
+
+		// save resume
+		if err := writeCommand("save resume"); err != nil {
+			return err
+		}
+
+		return nil
 	}
 
 	sigs := make(chan os.Signal, 1)
@@ -185,18 +318,54 @@ LOOP:
 				log.Printf("cmd result: %v", err)
 			}
 			log.Println("detected process exit")
+			serverStopped = true
 			break LOOP
 
 		case stdin := <-stdinChan:
+			if nowBackuping {
+				log.Printf("server is backuping now. stdin disabled.")
+				break
+			}
+
+			if strings.TrimSpace(stdin) == "@backup@" {
+				go func() {
+					if err := backupSequence(); err != nil {
+						log.Printf("error in backup sequence: %v", err)
+					}
+				}()
+				break
+			}
+
 			if err := writeCommand(stdin); err != nil {
 				log.Printf("write to process stdin failed: %v", err)
 			}
 
 		case <-sigs:
-			log.Printf("stop signal received")
-			log.Printf("sending stop command to server...")
-			if err := writeCommand("stop"); err != nil {
-				log.Printf("send stop failed: %v", err)
+			stopSequence := func() {
+				serverStopped = true
+				log.Printf("stop signal received")
+				log.Printf("sending stop command to server...")
+				if err := writeCommand("stop"); err != nil {
+					log.Printf("send stop failed: %v", err)
+				}
+			}
+
+			if nowBackuping {
+				log.Printf("server is backuping now. signals are sent back after backup finished.")
+				go func() {
+					timer := time.NewTicker(1 * time.Second)
+					for range timer.C {
+						if nowBackuping {
+							continue
+						}
+
+						timer.Stop()
+						break
+					}
+					stopSequence()
+				}()
+			} else {
+				stopSequence()
 			}
 
 			// case <-exitNotifier:
